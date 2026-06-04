@@ -18,7 +18,8 @@ def check(name, cond):
         failures.append(name)
 
 def ns(**kw):
-    base = {"processor": None, "model": None, "num": 15, "subreddit": "devops"}
+    base = {"processor": None, "model": None, "num": 15, "subreddit": "devops",
+            "config": False, "user": None}
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -27,7 +28,7 @@ def fresh_env(tmp):
     rm.ENV_FILE = Path(tmp) / ".env"
     if rm.ENV_FILE.exists():
         rm.ENV_FILE.unlink()
-    for k in ("PROCESSOR", "CLOUD_MODEL", "ANTHROPIC_API_KEY"):
+    for k in ("PROCESSOR", "CLOUD_MODEL", "LOCAL_MODEL", "ANTHROPIC_API_KEY"):
         os.environ.pop(k, None)
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -72,6 +73,31 @@ with tempfile.TemporaryDirectory() as tmp:
     check("no-key cloud falls back to local",
           rm.resolve_processing(ns(processor="cloud", model="haiku-4.5")) == ("local", None))
 
+    # 6b. -p local -m 9b → local + persisted local model
+    fresh_env(tmp)
+    res = rm.resolve_processing(ns(processor="local", model="9b"))
+    check("local+9b resolves", res == ("local", "9b"))
+    check("local model persisted to .env", "LOCAL_MODEL=9b" in rm.ENV_FILE.read_text())
+
+    # 6c. Sticky: saved LOCAL_MODEL=35b reused when no -m given
+    os.environ.pop("PROCESSOR", None); os.environ.pop("LOCAL_MODEL", None)
+    rm.set_env_var("LOCAL_MODEL", "35b")
+    os.environ.pop("LOCAL_MODEL", None)
+    rm.load_dotenv(rm.ENV_FILE)
+    check("sticky local model reused", rm.resolve_processing(ns()) == ("local", "35b"))
+
+    # 6d. -p local with no model and none saved → None (default OLLAMA_MODEL)
+    fresh_env(tmp)
+    check("local without model -> None", rm.resolve_processing(ns(processor="local")) == ("local", None))
+
+    # 6e. -p local -m bogus → exits "unknown local model"
+    fresh_env(tmp)
+    try:
+        rm.resolve_processing(ns(processor="local", model="bogus"))
+        check("unknown local model exits", False)
+    except SystemExit:
+        check("unknown local model exits", True)
+
     # 7. set_env_var updates existing key in place (no duplicate)
     fresh_env(tmp)
     rm.set_env_var("PROCESSOR", "local")
@@ -79,11 +105,41 @@ with tempfile.TemporaryDirectory() as tmp:
     body = rm.ENV_FILE.read_text()
     check("set_env_var updates in place", body.count("PROCESSOR=") == 1 and "PROCESSOR=cloud" in body)
 
+    # 7b. Config-only mode persists -p without a scrape/username/API key
+    fresh_env(tmp)
+    rm.apply_config_only(ns(processor="local"))
+    check("config-only persists processor", "PROCESSOR=local" in rm.ENV_FILE.read_text())
+
+    # 7c. Config-only persists -p cloud and -m together (no API key needed here)
+    fresh_env(tmp)
+    rm.apply_config_only(ns(processor="cloud", model="sonnet-4.6"))
+    saved = rm.ENV_FILE.read_text()
+    check("config-only persists cloud+model",
+          "PROCESSOR=cloud" in saved and "CLOUD_MODEL=sonnet-4.6" in saved)
+
+    # 7c2. Config-only persists -p local and -m 35b together
+    fresh_env(tmp)
+    rm.apply_config_only(ns(processor="local", model="35b"))
+    saved = rm.ENV_FILE.read_text()
+    check("config-only persists local+model",
+          "PROCESSOR=local" in saved and "LOCAL_MODEL=35b" in saved)
+
+    # 7d. Config-only with a bogus model exits
+    fresh_env(tmp)
+    try:
+        rm.apply_config_only(ns(model="bogus"))
+        check("config-only rejects bad model", False)
+    except SystemExit:
+        check("config-only rejects bad model", True)
+
 # 8. Model maps line up
 check("model map keys match labels", set(rm.CLOUD_MODELS) == set(rm.CLOUD_MODEL_LABELS))
 check("opus maps to claude-opus-4-8", rm.CLOUD_MODELS["opus-4.8"] == "claude-opus-4-8")
 check("sonnet maps to claude-sonnet-4-6", rm.CLOUD_MODELS["sonnet-4.6"] == "claude-sonnet-4-6")
 check("haiku maps to claude-haiku-4-5", rm.CLOUD_MODELS["haiku-4.5"] == "claude-haiku-4-5")
+check("local model map keys match labels", set(rm.LOCAL_MODELS) == set(rm.LOCAL_MODEL_LABELS))
+check("9b maps to qwen3.5:9b", rm.LOCAL_MODELS["9b"] == "qwen3.5:9b")
+check("35b maps to qwen3.6:35b-a3b", rm.LOCAL_MODELS["35b"] == "qwen3.6:35b-a3b")
 
 # 9. Username gate still enforced
 os.environ.pop("REDDIT_USERNAME", None)

@@ -32,8 +32,10 @@ to set `REDDIT_USERNAME`. That is expected — set the username, don't work arou
   ollama pull qwen3.5:9b     # default fallback; runs on ~16 GB RAM / Apple Silicon
   ```
   The default primary model is `qwen3.6:35b-a3b` (~18.5 GiB free RAM). If it
-  can't run, RedAlyser automatically falls back to `qwen3.5:9b`. If the user
-  only has the 9B model, set `OLLAMA_MODEL=qwen3.5:9b` in `.env`.
+  can't run, RedAlyser automatically falls back to `qwen3.5:9b`. To force the
+  smaller model (e.g. on a machine that can't run the 35B), pass `-m 9b` — see
+  below. Some machines report enough system RAM but still can't actually run the
+  35B; `-m 9b` is the fix.
 
 ## Running
 
@@ -47,7 +49,10 @@ to the console and is saved to `reddit_signal_<subreddit>_<timestamp>.md`.
 
 - Default is **local** (Ollama/Qwen). `-p cloud` switches to the **Anthropic API**;
   `-p local` switches back. The choice is **sticky** (persisted in `.env`).
-- Cloud requires `-m` to pick the model: `Opus-4.8`, `Sonnet-4.6`, or `Haiku-4.5`.
+- `-m` picks the model and is **sticky** for both backends:
+  - **Local:** `9b` (→ `qwen3.5:9b`) or `35b` (→ `qwen3.6:35b-a3b`). If unset,
+    the default `OLLAMA_MODEL` (35B) is used, falling back to 9B if it can't run.
+  - **Cloud:** `Opus-4.8`, `Sonnet-4.6`, or `Haiku-4.5` (required for cloud).
 - Cloud needs `ANTHROPIC_API_KEY`. If asked to enable cloud and no key is set,
   ask the user for their key (or have them paste it when the tool prompts). Do not
   invent a key. Without one, the tool falls back to local.

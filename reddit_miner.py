@@ -5,9 +5,14 @@ to either a LOCAL Ollama model (Qwen) or the CLOUD Anthropic API (Claude) for
 PMM analysis, and saves a markdown report.
 
 Usage: python3 reddit_miner.py <subreddit> [-n NUM] [-p local|cloud] [-m MODEL] [-u USERNAME]
+       python3 reddit_miner.py [--config] [-p local|cloud] [-m MODEL]   # change config only
 
 The processor (-p) is sticky: once set it persists in .env for every run until
-changed. -m selects the cloud model and is only needed for cloud.
+changed. -m selects the model (also sticky): for cloud it picks the Anthropic
+model; for local it picks the Ollama model size (9b | 35b).
+
+Run with no subreddit (or with --config) to just persist -p/-m settings and
+exit, without scraping anything — handy for flipping local⇄cloud between runs.
 
 Requires:
   1. Local: a running Ollama server with the target model pulled.
@@ -20,8 +25,9 @@ Environment variables (loaded from .env):
     PROCESSOR             local | cloud (sticky; set via -p)
     CLOUD_MODEL           opus-4.8 | sonnet-4.6 | haiku-4.5 (sticky; set via -m)
     ANTHROPIC_API_KEY     required for cloud processing
+    LOCAL_MODEL           9b | 35b (sticky; set via -m for local processing)
     OLLAMA_HOST           default http://localhost:11434
-    OLLAMA_MODEL          default qwen3.6:35b-a3b
+    OLLAMA_MODEL          default qwen3.6:35b-a3b (used when LOCAL_MODEL is unset)
     OLLAMA_FALLBACK_MODEL default qwen3.5:9b (used if the primary can't run)
     REDDIT_USERNAME      REQUIRED — your Reddit handle; used in the User-Agent
     REDDIT_CLIENT_ID     optional — switches to the authenticated Reddit API
@@ -52,6 +58,19 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.6:35b-a3b")
 # If the primary model can't run (e.g. not enough memory), fall back to this one.
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen3.5:9b")
+
+# Local processing (Ollama). Selectable models, keyed by the short size the user
+# passes to -m, mapped to the canonical Ollama model tag. Lets the user pick the
+# smaller model on machines that can't run the big one.
+LOCAL_MODELS = {
+    "9b": "qwen3.5:9b",
+    "35b": "qwen3.6:35b-a3b",
+}
+# Display labels for the status line, in the exact casing we print.
+LOCAL_MODEL_LABELS = {
+    "9b": "Qwen3.5-9B",
+    "35b": "Qwen3.6-35B-A3B",
+}
 
 # Cloud processing (Anthropic). Selectable models, keyed by the friendly name
 # the user passes to -m, mapped to the canonical API model ID.
@@ -404,15 +423,22 @@ def _stream_chat(model: str, messages: list[dict]) -> str:
     return "".join(chunks)
 
 
-def analyze_with_ollama(subreddit: str, reddit_data: str) -> str:
-    """Stream a PMM analysis, trying the primary model then the fallback."""
+def analyze_with_ollama(subreddit: str, reddit_data: str, model_key: str | None = None) -> str:
+    """Stream a PMM analysis, trying the chosen/primary model then the fallback.
+
+    `model_key` ("9b" | "35b") selects the primary Ollama model via -m. When None,
+    the default OLLAMA_MODEL is used. The fallback model is always appended so a
+    too-big primary still degrades gracefully.
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(subreddit, reddit_data)},
     ]
 
+    primary = LOCAL_MODELS[model_key] if model_key else OLLAMA_MODEL
+
     # Ordered, de-duplicated list of models to try.
-    candidates: list[str] = [OLLAMA_MODEL]
+    candidates: list[str] = [primary]
     if OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL not in candidates:
         candidates.append(OLLAMA_FALLBACK_MODEL)
 
@@ -490,11 +516,15 @@ def analyze_with_cloud(subreddit: str, reddit_data: str, model_key: str) -> str:
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
+REPORTS_DIR = Path("reports")
+
+
 def save_report(subreddit: str, report: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"reddit_signal_{subreddit}_{timestamp}.md"
-    Path(filename).write_text(report, encoding="utf-8")
-    return filename
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = REPORTS_DIR / f"reddit_signal_{subreddit}_{timestamp}.md"
+    path.write_text(report, encoding="utf-8")
+    return str(path)
 
 
 # ── Processor selection ───────────────────────────────────────────────────────
@@ -502,9 +532,10 @@ def save_report(subreddit: str, report: str) -> str:
 def resolve_processing(args: argparse.Namespace) -> tuple[str, str | None]:
     """Decide local vs cloud (and which cloud model), honoring sticky .env state.
 
-    `-p` persists the processor; `-m` persists the cloud model. With neither flag,
-    the saved preference is reused. Returns (processor, model_key); model_key is
-    None for local. Handles the no-model and no-API-key cases.
+    `-p` persists the processor; `-m` persists the chosen model (cloud or local).
+    With neither flag, the saved preference is reused. Returns (processor,
+    model_key); for local, model_key is "9b"/"35b" or None (use OLLAMA_MODEL
+    default). Handles the no-model and no-API-key cases.
     """
     # Processor: an explicit -p flag is sticky; otherwise read the saved value.
     if args.processor:
@@ -516,7 +547,18 @@ def resolve_processing(args: argparse.Namespace) -> tuple[str, str | None]:
             processor = "local"
 
     if processor == "local":
-        return "local", None
+        # Local model is selectable + sticky via -m (9b | 35b). Unset → default.
+        if args.model:
+            if args.model not in LOCAL_MODELS:
+                print(f"Unknown local model '{args.model}'. Choose: 9b | 35b")
+                sys.exit(1)
+            model_key = args.model
+            set_env_var("LOCAL_MODEL", model_key)
+        else:
+            model_key = (os.getenv("LOCAL_MODEL") or "").strip().lower()
+            if model_key not in LOCAL_MODELS:
+                model_key = None
+        return "local", model_key
 
     # Cloud: resolve the model (sticky). -m is required when switching to cloud
     # unless a model was previously saved.
@@ -544,13 +586,81 @@ def resolve_processing(args: argparse.Namespace) -> tuple[str, str | None]:
     return "cloud", model_key
 
 
+# ── Config-only mode ──────────────────────────────────────────────────────────
+
+def apply_config_only(args: argparse.Namespace) -> None:
+    """Persist sticky processor/model settings without running a scrape.
+
+    Invoked when reddit_miner.py is run with no subreddit (or with --config):
+    the -p/-m choices are written to .env and the resulting configuration is
+    printed. No Reddit username or network access is required — this path only
+    changes how future runs process data.
+    """
+    changed: list[str] = []
+    if args.processor:
+        set_env_var("PROCESSOR", args.processor)
+        changed.append(f"processor -> {args.processor}")
+
+    # Validate/persist -m against whichever processor is now effective, since the
+    # accepted model names differ (cloud: Opus/Sonnet/Haiku, local: 9b/35b).
+    effective = (os.getenv("PROCESSOR") or "local").strip().lower()
+    if args.model:
+        if effective == "cloud":
+            if args.model not in CLOUD_MODELS:
+                print(f"Unknown cloud model '{args.model}'. Choose: Opus-4.8 | Sonnet-4.6 | Haiku-4.5")
+                sys.exit(1)
+            set_env_var("CLOUD_MODEL", args.model)
+            changed.append(f"cloud model -> {CLOUD_MODEL_LABELS[args.model]}")
+        else:
+            if args.model not in LOCAL_MODELS:
+                print(f"Unknown local model '{args.model}'. Choose: 9b | 35b")
+                sys.exit(1)
+            set_env_var("LOCAL_MODEL", args.model)
+            changed.append(f"local model -> {LOCAL_MODEL_LABELS[args.model]}")
+
+    if not changed:
+        print(
+            "Config mode: nothing to change.\n"
+            "Pass -p local|cloud and/or -m MODEL to update settings, or give a\n"
+            "subreddit to run a scrape. Examples:\n"
+            "  python reddit_miner.py -p local\n"
+            "  python reddit_miner.py --config -p cloud -m sonnet-4.6"
+        )
+        return
+
+    print("Configuration updated:")
+    for c in changed:
+        print(f"  {c}")
+
+    # Echo the resulting effective configuration so the user sees the new state.
+    processor = (os.getenv("PROCESSOR") or "local").strip().lower()
+    if processor == "cloud":
+        model_key = (os.getenv("CLOUD_MODEL") or "").strip().lower()
+        label = CLOUD_MODEL_LABELS.get(model_key, "(none set — pass -m next time)")
+        print(f"\nProcessing is now: Cloud (Anthropic) — model {label}")
+    else:
+        local_key = (os.getenv("LOCAL_MODEL") or "").strip().lower()
+        label = LOCAL_MODEL_LABELS.get(local_key, f"default {OLLAMA_MODEL}")
+        print(f"\nProcessing is now: Local (Ollama/Qwen) — model {label}")
+    print(f"Saved to {ENV_FILE}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Mine PMM signals from a subreddit using a local Ollama model."
     )
-    parser.add_argument("subreddit", help="subreddit to analyze, e.g. devops")
+    parser.add_argument(
+        "subreddit", nargs="?", default=None,
+        help="subreddit to analyze, e.g. devops. Omit to just change config "
+             "(persist -p/-m) without scraping.",
+    )
+    parser.add_argument(
+        "--config", action="store_true",
+        help="config-only mode: persist -p/-m to .env and exit without "
+             "scraping (implied when no subreddit is given).",
+    )
     parser.add_argument(
         "-n", "--num", type=int, default=POSTS_TO_ANALYZE,
         metavar="NUM",
@@ -565,7 +675,8 @@ def main() -> None:
     parser.add_argument(
         "-m", "--model", type=lambda s: s.lower(),
         metavar="MODEL",
-        help="cloud model (cloud only): Opus-4.8 | Sonnet-4.6 | Haiku-4.5",
+        help="model to use (sticky). Cloud: Opus-4.8 | Sonnet-4.6 | Haiku-4.5. "
+             "Local: 9b (qwen3.5:9b) | 35b (qwen3.6:35b-a3b).",
     )
     parser.add_argument(
         "-u", "--user", metavar="USERNAME",
@@ -573,6 +684,13 @@ def main() -> None:
              "Handy for quick testing.",
     )
     args = parser.parse_args()
+
+    # Config-only mode: no subreddit (or explicit --config) means "just change
+    # how data is processed and exit". No username or network access required.
+    if args.config or args.subreddit is None:
+        load_dotenv(ENV_FILE)
+        apply_config_only(args)
+        return
 
     if args.num < 1:
         parser.error("-n/--num must be a positive integer")
@@ -596,7 +714,8 @@ def main() -> None:
     if processor == "cloud":
         print(f"Using Cloud Processing with model {CLOUD_MODEL_LABELS[model_key]}")
     else:
-        print("Using Local Processing with model QWEN")
+        local_label = LOCAL_MODEL_LABELS.get(model_key or "", f"QWEN (default {OLLAMA_MODEL})")
+        print(f"Using Local Processing with model {local_label}")
 
     print(f"\nMining signals from r/{subreddit} (top {num} posts)...\n")
 
@@ -630,7 +749,7 @@ def main() -> None:
     if processor == "cloud":
         report = analyze_with_cloud(subreddit, reddit_data, model_key)
     else:
-        report = analyze_with_ollama(subreddit, reddit_data)
+        report = analyze_with_ollama(subreddit, reddit_data, model_key)
     print("\n" + "=" * 70 + "\n")
 
     # 4 — Save
